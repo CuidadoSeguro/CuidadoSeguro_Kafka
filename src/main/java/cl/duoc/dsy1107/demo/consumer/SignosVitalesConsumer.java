@@ -14,8 +14,8 @@ import cl.duoc.dsy1107.demo.service.NotificacionCliente;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 
-import java.util.List;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -28,6 +28,7 @@ public class SignosVitalesConsumer {
     private final EvaluadorSignosVitales evaluador;
     private final NotificacionCliente notificacionCliente;
 
+    // Acumula lotes de tres registros por paciente mientras el consumidor permanece activo.
     private final Map<Long, List<SignoVital>> historialPorPaciente = new ConcurrentHashMap<>();
 
     public SignosVitalesConsumer(ObjectMapper objectMapper,
@@ -40,36 +41,64 @@ public class SignosVitalesConsumer {
 
     @KafkaListener(topics = KafkaConfig.TOPIC_SIGNOS_VITALES, groupId = "signos-vitales")
     public void procesar(ConsumerRecord<String, String> record) {
+        SignoVital signo;
         try {
-            SignoVital signo = objectMapper.readValue(record.value(), SignoVital.class);
-            log.info("[LEE] grupo=signos-vitales key={} valor={}", record.key(), record.value());
+            signo = objectMapper.readValue(record.value(), SignoVital.class);
+        } catch (Exception ex) {
+            log.error("[ERROR-DESERIALIZACION] topic={} partition={} offset={} causa={}",
+                    record.topic(), record.partition(), record.offset(), ex.getMessage(), ex);
+            throw new IllegalArgumentException("Mensaje de signos vitales inválido", ex);
+        }
 
-            Long pacienteId = signo.pacienteId();
-            if (pacienteId == null) {
-                log.warn("[IGNORA] signo vital sin pacienteId");
+        if (signo.pacienteId() == null) {
+            log.warn("[IGNORA] topic={} offset={} evento sin pacienteId",
+                    record.topic(), record.offset());
+            return;
+        }
+
+        if (signo.correoPaciente() == null || signo.correoPaciente().isBlank()) {
+            log.error("[ERROR-CORREO] pacienteId={} signoId={} no contiene correoPaciente",
+                    signo.pacienteId(), record.offset());
+            throw new IllegalArgumentException(
+                    "El evento de signos vitales no contiene correoPaciente");
+        }
+
+        List<SignoVital> historial = historialPorPaciente.computeIfAbsent(
+                signo.pacienteId(), id -> new ArrayList<>());
+
+        synchronized (historial) {
+            historial.add(signo);
+            log.info("[KAFKA-RECIBIDO] pacienteId={} signoId={} topic={} partition={} offset={} lote={}/3",
+                    signo.pacienteId(), record.offset(), record.topic(),
+                    record.partition(), record.offset(), historial.size());
+
+            if (historial.size() < 3) {
+                log.info("[ESPERA-3-SIGNOS] pacienteId={} registrosAcumulados={}/3",
+                        signo.pacienteId(), historial.size());
                 return;
             }
 
-            List<SignoVital> historial = historialPorPaciente.computeIfAbsent(pacienteId,
-                    k -> new ArrayList<>());
-            historial.add(signo);
-            if (historial.size() > 3) {
-                historial.remove(0);
-            }
+            List<SignoVital> tresRegistros = List.copyOf(historial.subList(0, 3));
+            EvaluacionSignos evaluacion = evaluador.evaluar(tresRegistros);
 
-            if (historial.size() == 3) {
-                EvaluacionSignos evaluacion = evaluador.evaluar(historial);
-                log.info("[EVALUA] paciente={} especialista={} requiereAtencion={}",
-                        pacienteId, evaluacion.especialista(), evaluacion.requiereAtencion());
+            log.info("[EVALUACION-3-SIGNOS] pacienteId={} especialista={} requiereAtencion={} ",
+                    signo.pacienteId(), evaluacion.especialista(), evaluacion.requiereAtencion());
 
-                notificacionCliente.enviarSugerenciaEspecialista(signo,
-                        evaluacion.especialista(), evaluacion.mensaje());
-            } else {
-                log.info("[ESPERA] paciente={} signos registrados: {}/3",
-                        pacienteId, historial.size());
+            try {
+                // Se envía después de cada lote completo de tres signos vitales.
+                notificacionCliente.enviarSugerenciaEspecialista(
+                        signo, evaluacion.especialista(), evaluacion.mensaje(),
+                        evaluacion.requiereAtencion());
+
+                historial.subList(0, 3).clear();
+                log.info("[CORREO-SOLICITADO-OK] pacienteId={} destinatario={} loteProcesado=3",
+                        signo.pacienteId(), signo.correoPaciente());
+            } catch (RuntimeException ex) {
+                // No limpiar el lote si el servicio de correo falla.
+                log.error("[ERROR-ENVIO-CORREO] pacienteId={} destinatario={} causa={}",
+                        signo.pacienteId(), signo.correoPaciente(), ex.getMessage(), ex);
+                throw ex;
             }
-        } catch (Exception ex) {
-            log.error("[ERROR] No se pudo procesar el mensaje: {}", ex.getMessage(), ex);
         }
     }
 }

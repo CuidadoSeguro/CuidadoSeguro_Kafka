@@ -3,10 +3,12 @@ server:
 
 spring:
   kafka:
-    bootstrap-servers: localhost:9092
+    # La aplicación Java se ejecuta localmente en VS Code; Kafka broker expone localhost:9092.
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     consumer:
-      group-id: cobros
+      group-id: signos-vitales
       auto-offset-reset: earliest
+      enable-auto-commit: false
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
     producer:
@@ -14,11 +16,14 @@ spring:
       value-serializer: org.apache.kafka.common.serialization.StringSerializer
     listener:
       missing-topics-fatal: false
+      ack-mode: record
 
 notificacion:
   service:
+    # Kafka app local -> Notification Service local.
     base-url: ${NOTIFICACION_SERVICE_URL:http://localhost:8089}
 
 logging:
   level:
     cl.duoc.dsy1107.demo: INFO
+    org.springframework.kafka: INFO
